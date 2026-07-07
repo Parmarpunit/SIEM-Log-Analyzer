@@ -1,0 +1,182 @@
+"""
+SIEM Log Analyzer
+------------------
+A log analysis tool that parses authentication logs (modeled on Windows
+Security Event Log fields: 4624 = successful logon, 4625 = failed logon)
+and flags suspicious activity a SOC Analyst would investigate.
+
+Detections implemented:
+    1. Brute Force        -> many failed logins (4625) from one source in a short window
+    2. Password Spraying  -> one source IP failing logins against MANY different usernames
+    3. Login After Failure -> a successful login (4624) immediately following failed attempts
+    4. Off-Hours Login     -> successful logins outside normal business hours (08:00-20:00)
+
+Usage:
+    python siem_log_analyzer.py sample_logs.csv
+"""
+
+import csv
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------------------
+# Config — tune these thresholds like you would tune real detection rules
+# ---------------------------------------------------------------------------
+BRUTE_FORCE_THRESHOLD = 5          # failed logins from same IP to trigger alert
+BRUTE_FORCE_WINDOW_MIN = 5         # time window (minutes) for brute force detection
+SPRAY_UNIQUE_USER_THRESHOLD = 4    # distinct usernames from same IP to flag spraying
+BUSINESS_HOURS_START = 8
+BUSINESS_HOURS_END = 20
+
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def load_logs(filepath):
+    """Read the CSV log file into a list of dicts, parsing timestamps."""
+    logs = []
+    with open(filepath, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row["timestamp"] = datetime.strptime(row["timestamp"], DATE_FORMAT)
+            logs.append(row)
+    # Sort chronologically — critical for any time-window based detection
+    logs.sort(key=lambda r: r["timestamp"])
+    return logs
+
+
+def detect_brute_force(logs):
+    """
+    Flag source IPs with >= BRUTE_FORCE_THRESHOLD failed logins (4625)
+    within a BRUTE_FORCE_WINDOW_MIN sliding window.
+    """
+    alerts = []
+    failures_by_ip = defaultdict(list)
+
+    for row in logs:
+        if row["event_id"] == "4625":
+            failures_by_ip[row["source_ip"]].append(row["timestamp"])
+
+    for ip, timestamps in failures_by_ip.items():
+        timestamps.sort()
+        for i in range(len(timestamps)):
+            window_end = timestamps[i] + timedelta(minutes=BRUTE_FORCE_WINDOW_MIN)
+            count_in_window = sum(1 for t in timestamps if timestamps[i] <= t <= window_end)
+            if count_in_window >= BRUTE_FORCE_THRESHOLD:
+                alerts.append({
+                    "type": "Brute Force",
+                    "severity": "High",
+                    "source_ip": ip,
+                    "detail": f"{count_in_window} failed logins within {BRUTE_FORCE_WINDOW_MIN} min "
+                              f"starting {timestamps[i]}"
+                })
+                break  # one alert per IP is enough, avoid duplicate spam
+    return alerts
+
+
+def detect_password_spraying(logs):
+    """
+    Flag source IPs that failed logins against many DIFFERENT usernames —
+    a signature of password spraying (one password tried against many accounts)
+    rather than brute force (many passwords against one account).
+    """
+    alerts = []
+    users_by_ip = defaultdict(set)
+
+    for row in logs:
+        if row["event_id"] == "4625":
+            users_by_ip[row["source_ip"]].add(row["username"])
+
+    for ip, users in users_by_ip.items():
+        if len(users) >= SPRAY_UNIQUE_USER_THRESHOLD:
+            alerts.append({
+                "type": "Password Spraying",
+                "severity": "High",
+                "source_ip": ip,
+                "detail": f"Failed logins against {len(users)} distinct accounts: {', '.join(sorted(users))}"
+            })
+    return alerts
+
+
+def detect_login_after_failure(logs):
+    """
+    Flag a successful login (4624) that immediately follows a run of failed
+    logins (4625) from the SAME source IP — a possible sign of a successful
+    brute-force / credential-guessing attack.
+    """
+    alerts = []
+    recent_failures = defaultdict(int)
+
+    for row in logs:
+        ip = row["source_ip"]
+        if row["event_id"] == "4625":
+            recent_failures[ip] += 1
+        elif row["event_id"] == "4624":
+            if recent_failures[ip] >= 3:
+                alerts.append({
+                    "type": "Login After Repeated Failures",
+                    "severity": "Critical",
+                    "source_ip": ip,
+                    "detail": f"Successful login for '{row['username']}' on {row['hostname']} "
+                              f"after {recent_failures[ip]} prior failures at {row['timestamp']}"
+                })
+            recent_failures[ip] = 0  # reset after a success
+    return alerts
+
+
+def detect_off_hours_logins(logs):
+    """Flag successful logins outside normal business hours."""
+    alerts = []
+    for row in logs:
+        if row["event_id"] == "4624":
+            hour = row["timestamp"].hour
+            if hour < BUSINESS_HOURS_START or hour >= BUSINESS_HOURS_END:
+                alerts.append({
+                    "type": "Off-Hours Login",
+                    "severity": "Medium",
+                    "source_ip": row["source_ip"],
+                    "detail": f"'{row['username']}' logged into {row['hostname']} at "
+                              f"{row['timestamp'].strftime('%H:%M')} on {row['timestamp'].date()}"
+                })
+    return alerts
+
+
+def print_report(alerts):
+    """Print a readable SOC-style alert summary, grouped by severity."""
+    if not alerts:
+        print("No suspicious activity detected.")
+        return
+
+    severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    alerts.sort(key=lambda a: severity_order.get(a["severity"], 4))
+
+    print("=" * 70)
+    print(f"SIEM ANALYSIS REPORT — {len(alerts)} alert(s) generated")
+    print("=" * 70)
+    for i, alert in enumerate(alerts, start=1):
+        print(f"\n[{i}] {alert['type']}  (Severity: {alert['severity']})")
+        print(f"    Source IP : {alert['source_ip']}")
+        print(f"    Detail    : {alert['detail']}")
+    print("\n" + "=" * 70)
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python siem_log_analyzer.py <logfile.csv>")
+        sys.exit(1)
+
+    filepath = sys.argv[1]
+    logs = load_logs(filepath)
+    print(f"Loaded {len(logs)} log entries from {filepath}\n")
+
+    alerts = []
+    alerts += detect_brute_force(logs)
+    alerts += detect_password_spraying(logs)
+    alerts += detect_login_after_failure(logs)
+    alerts += detect_off_hours_logins(logs)
+
+    print_report(alerts)
+
+
+if __name__ == "__main__":
+    main()
